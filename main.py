@@ -33,8 +33,8 @@ Examples:
             temperature=0.3
         )
         reply = completion.choices[0].message['content']
-    except:
-        reply = "Sorry, something went wrong."
+    except Exception as e:
+        reply = f"Error: {str(e)}"
 
     msg.body(reply)
     return str(response)
