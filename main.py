@@ -2,60 +2,74 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import google.generativeai as genai
 import os
+import re
 
+# Flask app setup
 app = Flask(__name__)
 
 # Configure Gemini API
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-MAX_CHARS = 1500
-last_request = {}  # store last full reply for each user
-
-def send_long_message(resp, text):
-    for i in range(0, len(text), MAX_CHARS):
-        resp.message(text[i:i+MAX_CHARS])
+# Store last ingredients for "details" requests
+last_ingredients = {}
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        incoming_msg = request.values.get('Body', '').strip()
-        from_number = request.values.get('From', '')  # unique per user
-        print(f"📩 Incoming from {from_number}: {incoming_msg}")
+    global last_ingredients
 
-        if not incoming_msg:
-            reply_text = "Please send me some ingredients."
-        elif incoming_msg.lower() == "details":
-            # Send the stored detailed reply
-            reply_text = last_request.get(from_number, "No details available. Please send ingredients first.")
-        else:
-            try:
-                # Short classification reply
-                short_reply = model.generate_content(
-                    f"For each ingredient in '{incoming_msg}', classify as one of:\n"
-                    "✅ Safe\n⚠️ Caution\n❌ Avoid\n"
-                    "Format: Ingredient – Emoji – Very short reason (max 8 words). No extra text."
-                )
-                short_text = short_reply.text.strip() if short_reply.text else "Could not classify."
-
-                # Store detailed reply for later
-                detailed_reply = model.generate_content(
-                    f"Analyze the following food ingredients in detail:\n{incoming_msg}\n"
-                    "Explain potential benefits and risks."
-                )
-                last_request[from_number] = detailed_reply.text.strip() if detailed_reply.text else "No details."
-
-                reply_text = short_text + "\n\nSend 'details' for full explanation."
-            except Exception as e:
-                print(f"❌ Gemini API error: {e}")
-                reply_text = "Sorry, something went wrong while analyzing your message."
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        reply_text = "Sorry, an unexpected error occurred."
+    incoming_msg = request.values.get('Body', '').strip()
+    sender = request.values.get('From', '')
+    print(f"📩 Incoming WhatsApp message from {sender}: {incoming_msg}")
 
     twiml = MessagingResponse()
-    send_long_message(twiml, reply_text)
-    print(f"📤 Sending to WhatsApp: {reply_text[:100]}...")
+
+    if not incoming_msg:
+        twiml.message("I didn’t receive any text. Please send me some ingredients or text.")
+        return str(twiml), 200, {'Content-Type': 'application/xml'}
+
+    # If user asks for details
+    if incoming_msg.lower() in ["details", "more", "full", "explain"]:
+        if sender in last_ingredients:
+            try:
+                detailed_reply = model.generate_content(
+                    f"Analyze the following food ingredients and explain if any are harmful: {last_ingredients[sender]}"
+                )
+                reply_text = detailed_reply.text.strip() if detailed_reply.text else "Sorry, no details available."
+            except Exception as e:
+                print(f"❌ Error from Gemini API: {e}")
+                reply_text = "Sorry, something went wrong while getting details."
+        else:
+            reply_text = "No recent ingredients to explain. Please send some first."
+
+        twiml.message(reply_text)
+        print(f"📤 Sending reply: {reply_text}")
+        return str(twiml), 200, {'Content-Type': 'application/xml'}
+
+    # Otherwise, classify ingredients
+    try:
+        short_reply = model.generate_content(
+            f"""Classify each of these ingredients into one of three categories:
+✅ Safe – Natural & minimal processing
+⚠️ Caution – Processed or synthetic but generally safe in small amounts
+❌ Avoid – Synthetic or harmful, with potential health risks
+
+Respond in this format:
+Ingredient – Emoji – Short reason
+
+Ingredients: {incoming_msg}"""
+        )
+        reply_text = short_reply.text.strip() if short_reply.text else "Sorry, I couldn’t classify that."
+
+        # Save the ingredients for future "details" requests
+        last_ingredients[sender] = incoming_msg
+
+    except Exception as e:
+        print(f"❌ Error from Gemini API: {e}")
+        reply_text = "Sorry, something went wrong while analyzing your message."
+
+    twiml.message(reply_text)
+    print(f"📤 Sending reply: {reply_text}")
     return str(twiml), 200, {'Content-Type': 'application/xml'}
 
 if __name__ == "__main__":
