@@ -3,8 +3,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 import google.generativeai as genai
 import requests
 import os
-from PIL import Image
-from io import BytesIO
+import threading
 
 app = Flask(__name__)
 
@@ -15,16 +14,29 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 # Store last detailed response for "details" follow-up
 last_details = {}
 
-def resize_image(image_bytes, max_width=1024):
-    """Resize image to reduce memory usage without losing OCR quality."""
-    with Image.open(BytesIO(image_bytes)) as img:
-        if img.width > max_width:
-            ratio = max_width / float(img.width)
-            new_height = int(img.height * ratio)
-            img = img.resize((max_width, new_height), Image.LANCZOS)
-        output = BytesIO()
-        img.save(output, format="JPEG", quality=85)
-        return output.getvalue()
+# List of keywords to trigger full details
+DETAIL_KEYWORDS = ["more info", "details", "tell me more", "full info", "explain", "explanation"]
+
+def process_detailed_response(from_number, media_data=None, media_type=None, text_input=None):
+    """Run in background to generate detailed Gemini analysis."""
+    try:
+        if media_data:
+            detailed_prompt = """Extract all ingredients from the image and give detailed explanation for each about safety, natural/artificial status, and health risks."""
+            details_resp = model.generate_content(
+                [{"mime_type": media_type, "data": media_data}, detailed_prompt]
+            )
+        else:
+            details_prompt = f"Analyze these ingredients in detail: {text_input}"
+            details_resp = model.generate_content(details_prompt)
+
+        long_reply = details_resp.text.strip() if details_resp.text else "No detailed data found."
+        last_details[from_number] = long_reply
+
+        print(f"✅ Stored detailed analysis for {from_number}")
+
+    except Exception as e:
+        print(f"❌ Error generating detailed response: {e}")
+        last_details[from_number] = "Sorry, I couldn't generate a detailed analysis."
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -36,98 +48,90 @@ def webhook():
 
     print(f"📩 Incoming WhatsApp message: {incoming_msg} | Media count: {media_count}")
 
-    # If user requests details from last message
-    if incoming_msg.lower() in ["details", "more", "explain", "more info", "full info", "tell me more"] \
-            and from_number in last_details:
+    # If user requests details
+    if incoming_msg.lower() in DETAIL_KEYWORDS and from_number in last_details:
+        reply_text = last_details[from_number]
         twiml = MessagingResponse()
-        twiml.message(last_details[from_number])
+        twiml.message(reply_text)
         print(f"📤 Sending detailed reply to {from_number}")
         return str(twiml), 200, {'Content-Type': 'application/xml'}
 
-    # If there's an image
+    # Handle image input
     if media_count > 0:
         media_url = request.values.get('MediaUrl0')
         media_type = request.values.get('MediaContentType0')
         print(f"🖼 Received image: {media_url} ({media_type})")
 
         try:
-            # Get and resize image to reduce memory load
-            img_data = requests.get(
-                media_url,
-                auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-            ).content
-            img_data = resize_image(img_data)
+            img_data = requests.get(media_url, auth=(
+                os.environ["TWILIO_ACCOUNT_SID"],
+                os.environ["TWILIO_AUTH_TOKEN"]
+            )).content
 
-            # Combined request to Gemini to get short & detailed outputs in one pass
-            combined_prompt = """
-Extract the list of ingredients from the image.
-
-First, give a **short** classification:
-Quick health check on your ingredients:
+            # Quick reply
+            quick_prompt = """Extract the list of ingredients from the image and for each ingredient, classify as:
 ✅ Safe – Natural and beneficial
 ⚠️ Caution – Artificial or could cause issues for some
 ❌ Avoid – Strongly advised against for health
 
-Respond with ingredient name, emoji, and short reason.
-
-Then, provide a **detailed** explanation for each ingredient:
-Include safety, whether it's natural/artificial, and any health risks.
-"""
+Respond only with ingredient name, emoji, and reason (short)."""
             gemini_reply = model.generate_content(
-                [{"mime_type": media_type, "data": img_data}, combined_prompt]
+                [{"mime_type": media_type, "data": img_data}, quick_prompt]
             )
+            short_reply = gemini_reply.text.strip() if gemini_reply.text else "Sorry, I couldn’t read that image."
 
-            # Split short and long parts if Gemini outputs them sequentially
-            if gemini_reply.text:
-                parts = gemini_reply.text.strip().split("\n\n", 1)
-                short_reply = parts[0]
-                long_reply = parts[1] if len(parts) > 1 else "No detailed data found."
-            else:
-                short_reply = "Sorry, I couldn’t read that image."
-                long_reply = "No detailed data found."
+            # Send quick reply instantly
+            reply_text = f"Quick health check on your ingredients:\n\n{short_reply}\n\nSend 'details' for full explanation."
+            twiml = MessagingResponse()
+            twiml.message(reply_text)
 
-            last_details[from_number] = long_reply
-            reply_text = short_reply + "\n\nSend 'details' for full explanation."
+            # Start background detailed processing
+            threading.Thread(
+                target=process_detailed_response,
+                args=(from_number,),
+                kwargs={"media_data": img_data, "media_type": media_type}
+            ).start()
 
-            # Free memory
-            del img_data
+            print(f"📤 Sending quick reply to {from_number}")
+            return str(twiml), 200, {'Content-Type': 'application/xml'}
 
         except Exception as e:
             print(f"❌ Error handling image: {e}")
-            reply_text = "Sorry, something went wrong processing the image."
+            twiml = MessagingResponse()
+            twiml.message("Sorry, something went wrong processing the image.")
+            return str(twiml), 200, {'Content-Type': 'application/xml'}
 
-    # If there's just text
+    # Handle text-only input
     else:
         try:
-            short_prompt = f"""
-Quick health check on your ingredients:
-Analyze the following ingredients: {incoming_msg}
+            quick_prompt = f"""Analyze the following ingredients: {incoming_msg}
+Classify each as:
 ✅ Safe – Natural and beneficial
 ⚠️ Caution – Artificial or could cause issues
 ❌ Avoid – Strongly advised against for health
-Respond with ingredient name, emoji, and short reason.
-"""
-            gemini_reply = model.generate_content(short_prompt)
+
+Respond only with ingredient name, emoji, and reason (short)."""
+            gemini_reply = model.generate_content(quick_prompt)
             short_reply = gemini_reply.text.strip()
 
-            details_prompt = f"""
-Analyze these ingredients in detail: {incoming_msg}
-Include safety, natural/artificial status, and health risks.
-"""
-            details_resp = model.generate_content(details_prompt)
-            long_reply = details_resp.text.strip()
+            reply_text = f"Quick health check on your ingredients:\n\n{short_reply}\n\nSend 'details' for full explanation."
+            twiml = MessagingResponse()
+            twiml.message(reply_text)
 
-            last_details[from_number] = long_reply
-            reply_text = short_reply + "\n\nSend 'details' for full explanation."
+            threading.Thread(
+                target=process_detailed_response,
+                args=(from_number,),
+                kwargs={"text_input": incoming_msg}
+            ).start()
+
+            print(f"📤 Sending quick reply to {from_number}")
+            return str(twiml), 200, {'Content-Type': 'application/xml'}
 
         except Exception as e:
             print(f"❌ Error from Gemini API: {e}")
-            reply_text = "Sorry, something went wrong."
-
-    twiml = MessagingResponse()
-    twiml.message(reply_text)
-    print(f"📤 Sending reply: {reply_text}")
-    return str(twiml), 200, {'Content-Type': 'application/xml'}
+            twiml = MessagingResponse()
+            twiml.message("Sorry, something went wrong.")
+            return str(twiml), 200, {'Content-Type': 'application/xml'}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
