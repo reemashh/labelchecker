@@ -9,10 +9,10 @@ app = Flask(__name__)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-MAX_CHARS = 1500  # safe limit for Twilio WhatsApp
+MAX_CHARS = 1500
+last_request = {}  # store last full reply for each user
 
 def send_long_message(resp, text):
-    """Split long text into safe-sized WhatsApp chunks."""
     for i in range(0, len(text), MAX_CHARS):
         resp.message(text[i:i+MAX_CHARS])
 
@@ -20,30 +20,42 @@ def send_long_message(resp, text):
 def webhook():
     try:
         incoming_msg = request.values.get('Body', '').strip()
-        print(f"📩 Incoming WhatsApp message: {incoming_msg}")
+        from_number = request.values.get('From', '')  # unique per user
+        print(f"📩 Incoming from {from_number}: {incoming_msg}")
 
         if not incoming_msg:
-            reply_text = "I didn’t receive any text. Please send me some ingredients or text."
+            reply_text = "Please send me some ingredients."
+        elif incoming_msg.lower() == "details":
+            # Send the stored detailed reply
+            reply_text = last_request.get(from_number, "No details available. Please send ingredients first.")
         else:
             try:
-                gemini_reply = model.generate_content(
-                    f"Analyze these food ingredients briefly. "
-                    f"Use max 5 bullet points, each under 20 words. {incoming_msg}"
+                # Short classification reply
+                short_reply = model.generate_content(
+                    f"For each ingredient in '{incoming_msg}', classify as one of:\n"
+                    "✅ Safe\n⚠️ Caution\n❌ Avoid\n"
+                    "Format: Ingredient – Emoji – Very short reason (max 8 words). No extra text."
                 )
-                reply_text = gemini_reply.text.strip() if gemini_reply.text else "Sorry, I couldn’t process that."
+                short_text = short_reply.text.strip() if short_reply.text else "Could not classify."
+
+                # Store detailed reply for later
+                detailed_reply = model.generate_content(
+                    f"Analyze the following food ingredients in detail:\n{incoming_msg}\n"
+                    "Explain potential benefits and risks."
+                )
+                last_request[from_number] = detailed_reply.text.strip() if detailed_reply.text else "No details."
+
+                reply_text = short_text + "\n\nSend 'details' for full explanation."
             except Exception as e:
-                print(f"❌ Error from Gemini API: {e}")
+                print(f"❌ Gemini API error: {e}")
                 reply_text = "Sorry, something went wrong while analyzing your message."
     except Exception as e:
         print(f"❌ Webhook error: {e}")
         reply_text = "Sorry, an unexpected error occurred."
 
-    # Create Twilio reply
     twiml = MessagingResponse()
     send_long_message(twiml, reply_text)
-
-    print(f"📤 Sending reply to WhatsApp: {reply_text[:100]}...")  # only log first 100 chars
-
+    print(f"📤 Sending to WhatsApp: {reply_text[:100]}...")
     return str(twiml), 200, {'Content-Type': 'application/xml'}
 
 if __name__ == "__main__":
