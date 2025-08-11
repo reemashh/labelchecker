@@ -3,88 +3,52 @@ from twilio.twiml.messaging_response import MessagingResponse
 import google.generativeai as genai
 import requests
 import os
+import pytesseract  # OCR library
+from PIL import Image
+from io import BytesIO
 
 app = Flask(__name__)
 
-# Configure Gemini API
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-text_model = genai.GenerativeModel("gemini-1.5-flash")  # text only
-vision_model = genai.GenerativeModel("gemini-1.5-pro-vision")  # text + image
-
-# Store last analysis for details request
+text_model = genai.GenerativeModel("gemini-1.5-flash")
 last_analysis = {}
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global last_analysis
+    incoming = request.values.get("Body", "").strip().lower()
+    num_media = int(request.values.get("NumMedia", 0))
+    sender = request.values.get("From", "")
+    resp = MessagingResponse()
 
-    try:
-        incoming_msg = request.values.get("Body", "").strip().lower()
-        num_media = int(request.values.get("NumMedia", 0))
-        print(f"📩 Incoming WhatsApp message: {incoming_msg} | Media count: {num_media}")
+    if incoming in ["details", "explain", "more info"] and sender in last_analysis:
+        resp.message(last_analysis[sender])
+        return str(resp), 200
 
-        reply_text = ""
+    if num_media > 0:
+        # Download and OCR
+        media_url = request.values.get("MediaUrl0")
+        img = Image.open(BytesIO(requests.get(media_url).content))
+        extracted_text = pytesseract.image_to_string(img)
 
-        if incoming_msg == "details" and "details" in last_analysis:
-            reply_text = last_analysis["details"]
+        if not extracted_text.strip():
+            resp.message("Couldn't read ingredients. Please send clear photo or type it.")
+            return str(resp), 200
 
-        else:
-            if num_media > 0:
-                # Get the first image
-                media_url = request.values.get("MediaUrl0")
-                content_type = request.values.get("MediaContentType0")
-                print(f"🖼 Received image: {media_url} ({content_type})")
+        ingredient_text = extracted_text
+    else:
+        ingredient_text = incoming
 
-                # Download image
-                img_data = requests.get(media_url).content
+    # Classification
+    classify_prompt = f"Classify these ingredients with emoji:\n{ingredient_text}"
+    classify_resp = text_model.generate_content(classify_prompt)
+    short = classify_resp.text.strip()
 
-                # Ask Gemini to read & classify
-                prompt = """
-                You are an expert in food safety.
-                1. Read all ingredients from the image of a food package label.
-                2. Classify each ingredient as:
-                   ✅ Safe – Natural and generally harmless.
-                   ⚠️ Caution – Processed or with potential mild health concerns.
-                   ❌ Avoid – Harmful or linked to significant health risks.
-                3. Only return the classification list in short form.
-                """
-                result = vision_model.generate_content([prompt, {"mime_type": content_type, "data": img_data}])
+    last_analysis[sender] = text_model.generate_content(
+        f"Give detailed safety analysis for each ingredient: {ingredient_text}"
+    ).text.strip()
 
-                reply_text = result.text.strip() if result.text else "Sorry, I couldn’t read the image."
-
-                # Save details for later
-                details_prompt = f"Provide detailed safety analysis for each ingredient found in this image: {result.text}"
-                details_result = text_model.generate_content(details_prompt)
-                last_analysis["details"] = details_result.text.strip()
-
-            else:
-                # Text ingredient list
-                classification_prompt = f"""
-                Classify the following ingredients as:
-                ✅ Safe – Natural and generally harmless.
-                ⚠️ Caution – Processed or with potential mild health concerns.
-                ❌ Avoid – Harmful or linked to significant health risks.
-                Ingredients: {incoming_msg}
-                """
-                class_result = text_model.generate_content(classification_prompt)
-                reply_text = class_result.text.strip()
-
-                # Save details for later
-                details_prompt = f"Provide detailed safety analysis for each ingredient: {incoming_msg}"
-                details_result = text_model.generate_content(details_prompt)
-                last_analysis["details"] = details_result.text.strip()
-
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        reply_text = "Sorry, something went wrong."
-
-    # Twilio response
-    twiml = MessagingResponse()
-    twiml.message(reply_text)
-    print(f"📤 Sending reply: {reply_text}")
-    return str(twiml), 200, {"Content-Type": "application/xml"}
-
+    resp.message(short)
+    return str(resp), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
