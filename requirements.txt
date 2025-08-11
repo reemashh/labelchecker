@@ -1,4 +1,5 @@
-flask
+Flask
 twilio
-gunicorn
 google-generativeai
+requests
+Pillow
