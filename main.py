@@ -1,10 +1,12 @@
 from flask import Flask, request
-from openai import OpenAI
 import os
+import google.generativeai as genai
 from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# Configure Gemini API
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 @app.route("/webhook", methods=["POST"])
 def whatsapp_webhook():
@@ -29,18 +31,15 @@ Examples:
 """
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
-        )
-        reply = completion.choices[0].message.content
+        model = genai.GenerativeModel("gemini-pro")
+        completion = model.generate_content(prompt)
+        reply = completion.text.strip()
     except Exception as e:
-        print(f"❌ Error from OpenAI API: {e}")
+        print(f"❌ Error from Gemini API: {e}")
         reply = "Sorry, something went wrong."
 
     msg.body(reply)
     return str(response)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run()
