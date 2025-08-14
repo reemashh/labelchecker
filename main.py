@@ -12,6 +12,8 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Store last detailed response for "details" follow-up
 last_details = {}
+# Track numbers we’ve already welcomed
+seen_users = set()
 
 def split_message(text, max_length=1500):
     """Split text into chunks under max_length without breaking words."""
@@ -31,7 +33,7 @@ def split_message(text, max_length=1500):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global last_details
+    global last_details, seen_users
 
     from_number = request.values.get('From', '')
     incoming_msg = request.values.get('Body', '').strip()
@@ -39,8 +41,9 @@ def webhook():
 
     print(f"📩 Incoming WhatsApp message: {incoming_msg} | Media count: {media_count}")
 
-    # If user just joined with sandbox join code
-    if incoming_msg.lower().startswith("join "):
+    # First-time welcome message
+    if from_number not in seen_users:
+        seen_users.add(from_number)
         twiml = MessagingResponse()
         welcome_msg = "Hi 👋, welcome to SafeEats AI! Please send an ingredients list (text) or a clear photo of the ingredients panel."
         twiml.message(welcome_msg)
@@ -65,7 +68,7 @@ def webhook():
         try:
             img_data = requests.get(media_url, auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])).content
 
-            # Short classification
+            # Send image to Gemini for OCR + short classification
             prompt = """Extract the list of ingredients from the image and for each ingredient, classify as:
 ✅ Safe – Natural and beneficial
 ⚠️ Caution – Artificial or could cause issues for some
@@ -78,12 +81,13 @@ Respond only with ingredient name, emoji, and reason (short)."""
 
             short_reply = gemini_reply.text.strip() if gemini_reply.text else "Sorry, I couldn’t read that image."
 
-            # Store long version
+            # Now also store long version for later
             detailed_prompt = """Extract all ingredients from the image and give detailed explanation for each about safety, natural/artificial status, and health risks."""
             details_resp = model.generate_content(
                 [{"mime_type": media_type, "data": img_data}, detailed_prompt]
             )
             long_reply = details_resp.text.strip() if details_resp.text else "No detailed data found."
+
             last_details[from_number] = long_reply
 
             reply_text = short_reply + "\n\nSend 'details' for full explanation."
