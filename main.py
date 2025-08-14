@@ -39,6 +39,14 @@ def webhook():
 
     print(f"📩 Incoming WhatsApp message: {incoming_msg} | Media count: {media_count}")
 
+    # If user just joined with sandbox join code
+    if incoming_msg.lower().startswith("join "):
+        twiml = MessagingResponse()
+        welcome_msg = "Hi 👋, welcome to SafeEats AI! Please send an ingredients list (text) or a clear photo of the ingredients panel."
+        twiml.message(welcome_msg)
+        print(f"📤 Sent welcome message to {from_number}")
+        return str(twiml), 200, {'Content-Type': 'application/xml'}
+
     # Handle detailed info request with chunked response
     if incoming_msg.lower() in ["details", "more", "explain"] and from_number in last_details:
         full_text = last_details[from_number]
@@ -57,7 +65,7 @@ def webhook():
         try:
             img_data = requests.get(media_url, auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])).content
 
-            # Send image to Gemini for OCR + short classification
+            # Short classification
             prompt = """Extract the list of ingredients from the image and for each ingredient, classify as:
 ✅ Safe – Natural and beneficial
 ⚠️ Caution – Artificial or could cause issues for some
@@ -70,13 +78,12 @@ Respond only with ingredient name, emoji, and reason (short)."""
 
             short_reply = gemini_reply.text.strip() if gemini_reply.text else "Sorry, I couldn’t read that image."
 
-            # Now also store long version for later
+            # Store long version
             detailed_prompt = """Extract all ingredients from the image and give detailed explanation for each about safety, natural/artificial status, and health risks."""
             details_resp = model.generate_content(
                 [{"mime_type": media_type, "data": img_data}, detailed_prompt]
             )
             long_reply = details_resp.text.strip() if details_resp.text else "No detailed data found."
-
             last_details[from_number] = long_reply
 
             reply_text = short_reply + "\n\nSend 'details' for full explanation."
